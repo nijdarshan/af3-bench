@@ -1,0 +1,2 @@
+engine,pass_index,start_ts,elapsed_ms,device,seq_len,commit,notes,cpu_brand
+deepmind,0,2025-08-09T23:36:32.480759+00:00,12.527942657470703,cpu,8,2e2ffc10ab13b1d6f0234d0007488c4a3dedf3e6,dm-mps,Apple M4 Max

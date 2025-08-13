@@ -1,0 +1,2 @@
+{"commit":"621531e4f36c3ce5e20157f88f27049d3f3f1fcc","cpu_brand":"Apple M4 Max","device":"cpu","elapsed_ms":12.543916702270508,"engine":"ligo","notes":"ligo-forward","ok":false,"pass_index":0,"seq_len":16,"start_ts":"2025-08-09T22:20:48.037255+00:00"}
+{"commit":"621531e4f36c3ce5e20157f88f27049d3f3f1fcc","cpu_brand":"Apple M4 Max","device":"cpu","elapsed_ms":12.501001358032228,"engine":"ligo","notes":"ligo-forward","ok":false,"pass_index":1,"seq_len":16,"start_ts":"2025-08-09T22:20:48.049939+00:00"}

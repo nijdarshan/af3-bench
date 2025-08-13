@@ -1,0 +1,2 @@
+engine,pass_index,start_ts,elapsed_ms,device,seq_len,commit,notes,cpu_brand
+ligo,0,2025-08-09T22:56:45.298733+00:00,12.51506805419922,mps,8,621531e4f36c3ce5e20157f88f27049d3f3f1fcc,mps-diagnose5,Apple M4 Max

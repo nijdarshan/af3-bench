@@ -1,0 +1,1 @@
+{"commit":"2e2ffc10ab13b1d6f0234d0007488c4a3dedf3e6","cpu_brand":"Apple M4 Max","device":"cpu","elapsed_ms":12.524843215942385,"engine":"deepmind","error":"ModuleNotFoundError: No module named 'jax'","notes":"dm-mps","ok":false,"pass_index":0,"seq_len":8,"start_ts":"2025-08-09T23:38:13.585799+00:00"}

@@ -1,0 +1,1 @@
+{"commit":"621531e4f36c3ce5e20157f88f27049d3f3f1fcc","cpu_brand":"Apple M4 Max","device":"mps","elapsed_ms":12.524127960205078,"engine":"ligo","error":"ModuleNotFoundError: No module named 'src.models.model'","notes":"mps-diagnose7","ok":false,"pass_index":0,"seq_len":8,"start_ts":"2025-08-09T22:58:40.667061+00:00"}
