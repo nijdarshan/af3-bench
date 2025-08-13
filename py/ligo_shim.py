@@ -18,13 +18,19 @@ try:
 except Exception:
     pass
 
-# Ensure Ligo repo root and its src/ are on sys.path
+# Ensure Ligo repo root and its src/ are on sys.path (support multiple repo folder names)
 try:
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'third_party', 'alphafold3-ligo'))
-    repo_src = os.path.join(repo_root, 'src')
-    for p in [repo_root, repo_src]:
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    third_party = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'third_party'))
+    candidates = [
+        os.path.join(third_party, 'alphafold3-ligo'),
+        os.path.join(third_party, 'AlphaFold3'),
+        os.path.join(third_party, 'alphafold3'),
+    ]
+    for root in candidates:
+        src = os.path.join(root, 'src')
+        for p in [root, src]:
+            if os.path.isdir(p) and p not in sys.path:
+                sys.path.insert(0, p)
 except Exception:
     pass
 
@@ -43,10 +49,11 @@ def _build_minimal_ligo_config() -> Any:
                 raise AttributeError(k)
         def __setattr__(self, k, v):
             self[k] = v
-    c_token = 64
-    c_pair = 32
-    c_atom = 32
-    c_atompair = 8
+    # Use sizes that align with common AF3 trunk defaults
+    c_token = 384
+    c_pair = 128
+    c_atom = 64
+    c_atompair = 32
     cfg = C()
     cfg.globals = C(
         chunk_size=None,
@@ -66,14 +73,14 @@ def _build_minimal_ligo_config() -> Any:
     )
     cfg["msa_module"] = C(
         no_blocks=1,
-        c_msa=32,
+        c_msa=128,
         c_token=c_token,
         c_z=c_pair,
-        c_hidden=16,
+        c_hidden=128,
         no_heads=4,
-        c_hidden_tri_mul=32,
-        c_hidden_pair_attn=16,
-        no_heads_tri_attn=2,
+        c_hidden_tri_mul=64,
+        c_hidden_pair_attn=64,
+        no_heads_tri_attn=4,
         transition_n=2,
         pair_dropout=0.0,
         fuse_projection_weights=False,
@@ -85,10 +92,10 @@ def _build_minimal_ligo_config() -> Any:
         c_s=c_token,
         c_z=c_pair,
         no_blocks=4,
-        c_hidden_mul=32,
-        c_hidden_pair_attn=16,
-        no_heads_tri_attn=2,
-        no_heads_single_attn=4,
+        c_hidden_mul=128,
+        c_hidden_pair_attn=64,
+        no_heads_tri_attn=4,
+        no_heads_single_attn=8,
         transition_n=2,
         pair_dropout=0.0,
         fuse_projection_weights=False,
@@ -104,8 +111,8 @@ def _build_minimal_ligo_config() -> Any:
         atom_encoder_blocks=1,
         atom_encoder_heads=4,
         dropout=0.0,
-        atom_attention_n_queries=16,
-        atom_attention_n_keys=32,
+        atom_attention_n_queries=32,
+        atom_attention_n_keys=128,
         atom_decoder_blocks=1,
         atom_decoder_heads=4,
         token_transformer_blocks=2,
@@ -126,7 +133,10 @@ def _build_minimal_ligo_config() -> Any:
 
 def _select_device(device: str):
     import torch
-    if device.lower() == "mps" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    req = device.lower()
+    if req == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda"), "cuda"
+    if req == "mps" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps"), "mps"
     return torch.device("cpu"), "cpu"
 
@@ -147,7 +157,12 @@ def _build_dummy_batch(seq_len: int, device: str = "cpu") -> "Dict[str, Any]":
     residue_index = torch.arange(n_tokens, device=dev).view(1, n_tokens)
     token_index = residue_index.clone()
     # Atom-to-token mapping (4 atoms per token)
-    atom_to_token = torch.repeat_interleave(torch.arange(n_tokens, device=dev), 4).view(1, n_atoms)
+    token_indices = torch.arange(n_tokens, device=dev)
+    atom_to_token = torch.repeat_interleave(token_indices, 4).view(1, n_atoms)
+    # Within-token atom index 0..3
+    token_atom_idx = (torch.arange(n_atoms, device=dev) % 4).view(1, n_atoms)
+    # Representative atom index per token: first atom of each token in flat layout
+    token_repr_atom = (torch.arange(n_tokens, device=dev) * 4).view(1, n_tokens)
     # Space UID: same as token index for simplicity
     ref_space_uid = atom_to_token.clone()
 
@@ -168,8 +183,10 @@ def _build_dummy_batch(seq_len: int, device: str = "cpu") -> "Dict[str, Any]":
         # Atom-wise
         "ref_pos": add_cycle(torch.zeros((bs, n_atoms, 3), dtype=torch.float32, device=dev)),
         "ref_mask": add_cycle(torch.ones((bs, n_atoms), dtype=torch.float32, device=dev)),
+        # Element one-hot limited to 4 per model impl (H,C,N,O)
         "ref_element": add_cycle(torch.zeros((bs, n_atoms, 4), dtype=torch.float32, device=dev)),
         "ref_charge": add_cycle(torch.zeros((bs, n_atoms), dtype=torch.float32, device=dev)),
+        # Provide [N_atom, 4] so downstream reshape(batch,n_atoms,4) is valid
         "ref_atom_name_chars": add_cycle(torch.zeros((bs, n_atoms, 4), dtype=torch.float32, device=dev)),
         "ref_space_uid": add_cycle(ref_space_uid.to(torch.long)),
 
@@ -179,6 +196,8 @@ def _build_dummy_batch(seq_len: int, device: str = "cpu") -> "Dict[str, Any]":
 
         # Mapping features
         "atom_to_token": add_cycle(atom_to_token.to(torch.long)),
+        "token_atom_idx": add_cycle(token_atom_idx.to(torch.long)),
+        "token_repr_atom": add_cycle(token_repr_atom.to(torch.long)),
 
         # Training-time placeholders (not used in inference path)
         "all_atom_positions": add_cycle(torch.zeros((bs, n_atoms, 3), dtype=torch.float32, device=dev)),
@@ -231,9 +250,9 @@ def forward_once(
                 })
             return results
 
-        # On MPS (macOS), skip heavy diffusion unless full=True (unsupported)
+        # Skip heavy diffusion unless explicitly full mode
         resolved_device_name = device.lower()
-        if resolved_device_name == 'mps' and not full:
+        if (resolved_device_name in ('mps','cpu','cuda') and mode.lower() != 'full') or (resolved_device_name == 'mps' and not full):
             try:
                 import src.models.diffusion_module as _dm
                 import torch as _torch
@@ -250,26 +269,35 @@ def forward_once(
         model = AlphaFold3(cfg).to(torch_device).eval()
         batch = _build_dummy_batch(max(4, int(seq_len)), device=resolved_device)
 
-        # Warmup (optional minimal step to trigger init). Keep recycling dim; model removes it internally.
+        # Warmup (measure initial pass as compile/init time proxy)
+        warmup_start = time.time()
         _ = model({k: v.clone() for k, v in batch.items()}, train=False)
+        compile_ms = (time.time() - warmup_start) * 1000.0
 
         for i in range(passes):
             start_ts = datetime.now(timezone.utc).isoformat()
             start = time.time()
             _ = model({k: v.clone() for k, v in batch.items()}, train=False)
             elapsed_ms = (time.time() - start) * 1000.0
-            results.append(
-                {
-                    "engine": "ligo",
-                    "pass_index": i,
-                    "start_ts": start_ts,
-                    "elapsed_ms": elapsed_ms,
-                    "device": resolved_device,
-                    "seq_len": int(seq_len),
-                    "notes": notes,
-                    "ok": True,
-                }
-            )
+            gpu_name = None
+            try:
+                if resolved_device == 'cuda':
+                    gpu_name = torch.cuda.get_device_name(0)
+            except Exception:
+                gpu_name = None
+            results.append({
+                "engine": "ligo",
+                "pass_index": i,
+                "start_ts": start_ts,
+                "elapsed_ms": elapsed_ms,
+                "device": resolved_device,
+                "seq_len": int(seq_len),
+                "notes": notes,
+                "compile_ms": compile_ms,
+                "gpu_name": gpu_name,
+                "mode": mode,
+                "ok": True,
+            })
         return results
     except Exception as e:
         # Fallback to stub if imports or forward fail

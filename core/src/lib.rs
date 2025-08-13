@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use serde_json::Value as JsonValue;
-use std::env;
 
 /// Call a Python shim module for the specified engine.
 /// engine: "deepmind" or "ligo"
