@@ -16,6 +16,182 @@ try:
         sys.path.insert(0, site_pkgs)
 except Exception:
     pass
+
+
+def _ensure_dm_cpp_and_rdkit_stubs() -> None:
+    """Ensure import-time deps exist for DeepMind modules without heavy installs.
+
+    Provides lightweight stubs for `alphafold3.cpp` and `rdkit` if missing so
+    that module imports succeed. We don't call into these stubs during
+    benchmarking; they exist only to satisfy import-time references.
+    """
+    try:
+        import importlib.util, types
+        # alphafold3.cpp and its submodules
+        if importlib.util.find_spec('alphafold3.cpp') is None:
+            cpp_mod = types.ModuleType('alphafold3.cpp')
+            sys.modules['alphafold3.cpp'] = cpp_mod
+            # Create dummy submodules frequently imported by DM code
+            submods = [
+                'cif_dict', 'msa_profile', 'mmcif_atom_site', 'mmcif_struct_conn',
+                'string_array', 'membership', 'aggregation', 'fasta_iterator',
+                'msa_conversion', 'mmcif_utils', 'mkdssp'
+            ]
+            for name in submods:
+                full = f'alphafold3.cpp.{name}'
+                m = types.ModuleType(full)
+                sys.modules[full] = m
+                setattr(cpp_mod, name, m)
+            # Provide minimal API expected by chemical_components and friends
+            try:
+                cif = sys.modules['alphafold3.cpp.cif_dict']
+                def _parse_multi_data_cif(s: str):
+                    return {}
+                class _CifDict(dict):
+                    pass
+                cif.parse_multi_data_cif = _parse_multi_data_cif
+                cif.CifDict = _CifDict
+            except Exception:
+                pass
+        # Avoid importing real rdkit_utils (which requires RDKit). Provide a stub.
+        if importlib.util.find_spec('alphafold3.data.tools.rdkit_utils') is None:
+            stub = types.ModuleType('alphafold3.data.tools.rdkit_utils')
+            sys.modules['alphafold3.data.tools.rdkit_utils'] = stub
+        # zstandard is optional; stub if missing
+        if importlib.util.find_spec('zstandard') is None:
+            sys.modules['zstandard'] = types.ModuleType('zstandard')
+        # rdkit minimal
+        if importlib.util.find_spec('rdkit') is None:
+            rdkit_mod = types.ModuleType('rdkit')
+            chem_mod = types.ModuleType('rdkit.Chem')
+            sys.modules['rdkit'] = rdkit_mod
+            sys.modules['rdkit.Chem'] = chem_mod
+            rdkit_mod.Chem = chem_mod
+            # Provide minimal API symbols used in DM code paths
+            class _Dummy:
+                pass
+            class BondType:
+                SINGLE = 1
+                DOUBLE = 2
+                TRIPLE = 3
+                DATIVE = 4
+            class BondStereo:
+                STEREONONE = 0
+                STEREOE = 1
+                STEREOZ = 2
+                STEREOCIS = 3
+                STEREOTRANS = 4
+            class Atom:
+                def __init__(self, *_args, **_kwargs):
+                    self._props = {}
+                def SetNoImplicit(self, *_):
+                    return None
+                def SetProp(self, k, v):
+                    self._props[k] = v
+                def SetFormalCharge(self, *_):
+                    return None
+                def SetPDBResidueInfo(self, *_):
+                    return None
+                def GetSymbol(self):
+                    return 'C'
+                def GetIdx(self):
+                    return 0
+                def HasProp(self, k):
+                    return k in self._props
+                def GetProp(self, k):
+                    return self._props.get(k, '')
+            class AtomPDBResidueInfo:
+                def SetName(self, *_):
+                    pass
+                def SetIsHeteroAtom(self, *_):
+                    pass
+                def SetResidueName(self, *_):
+                    pass
+                def SetResidueNumber(self, *_):
+                    pass
+            class Conformer:
+                def __init__(self, *_):
+                    pass
+                def SetAtomPosition(self, *_):
+                    pass
+            class _Bond:
+                def __init__(self):
+                    self._is_aromatic = False
+                def SetIsAromatic(self, b):
+                    self._is_aromatic = bool(b)
+                def GetBondType(self):
+                    return BondType.SINGLE
+                def GetStereo(self):
+                    return BondStereo.STEREONONE
+                def GetBeginAtom(self):
+                    return Atom()
+                def GetEndAtom(self):
+                    return Atom()
+            class RWMol:
+                def __init__(self):
+                    self._atoms = []
+                    self._bonds = []
+                def AddAtom(self, _):
+                    self._atoms.append(Atom())
+                    return len(self._atoms) - 1
+                def AddBond(self, *_):
+                    self._bonds.append(_Bond())
+                    return len(self._bonds)
+                def GetBondWithIdx(self, idx):
+                    return self._bonds[idx]
+                def UpdatePropertyCache(self, *_ , **__):
+                    pass
+                def AddConformer(self, *_):
+                    pass
+                def GetConformer(self, *_):
+                    return Conformer(0)
+                def GetAtoms(self):
+                    return []
+                def GetBonds(self):
+                    return []
+            class Mol(RWMol):
+                pass
+            def SanitizeMol(*_):
+                pass
+            def RemoveHs(x):
+                return x
+            def RenumberAtoms(mol, _order):
+                return mol
+            def Kekulize(*_):
+                pass
+            def AssignStereochemistryFrom3D(*_):
+                pass
+            def AddHs(mol):
+                return mol
+            # Expose AllChem submodule
+            AllChem = types.ModuleType('rdkit.Chem.AllChem')
+            def ETKDGv3():
+                class _P:
+                    def __init__(self):
+                        self.randomSeed = 0
+                        self.maxIterations = 0
+                return _P()
+            def EmbedMolecule(*_args, **_kwargs):
+                return 0
+            AllChem.ETKDGv3 = ETKDGv3
+            AllChem.EmbedMolecule = EmbedMolecule
+            # Attach to chem_mod
+            chem_mod.BondType = BondType
+            chem_mod.BondStereo = BondStereo
+            chem_mod.Atom = Atom
+            chem_mod.AtomPDBResidueInfo = AtomPDBResidueInfo
+            chem_mod.Conformer = Conformer
+            chem_mod.RWMol = RWMol
+            chem_mod.Mol = Mol
+            chem_mod.SanitizeMol = SanitizeMol
+            chem_mod.RemoveHs = RemoveHs
+            chem_mod.RenumberAtoms = RenumberAtoms
+            chem_mod.Kekulize = Kekulize
+            chem_mod.AssignStereochemistryFrom3D = AssignStereochemistryFrom3D
+            chem_mod.AddHs = AddHs
+            chem_mod.AllChem = AllChem
+    except Exception:
+        pass
 import warnings
 warnings.filterwarnings("ignore")
 from datetime import datetime, timezone
@@ -48,16 +224,18 @@ def _build_dm_synthetic_batch(seq_len: int) -> "Dict[str, Any]":
     from alphafold3.model.atom_layout import atom_layout as al
 
     L = int(max(4, seq_len))
-    D = 4  # atoms per token for masks/positions
+    D = 32  # atoms per token for masks/positions (align with queries_subset_size)
     # Total atoms rounded up to a multiple of queries subset size (32)
     queries_subset_size = 32
     keys_subset_size = 128
     total_atoms = L * D
     num_atoms = int(np.ceil(total_atoms / queries_subset_size) * queries_subset_size)
 
+    # Use a small but >1 MSA size to satisfy truncation logic downstream.
+    msa_n = 16
     padding = features.PaddingShapes(
         num_tokens=L,
-        msa_size=1,
+        msa_size=msa_n,
         num_chains=1,
         num_templates=0,
         num_atoms=num_atoms,
@@ -79,14 +257,14 @@ def _build_dm_synthetic_batch(seq_len: int) -> "Dict[str, Any]":
     is_nonstandard_polymer_chain = np.zeros(L, dtype=bool)
     is_water = np.zeros(L, dtype=bool)
 
-    # MSA minimal (1 row)
-    msa = np.zeros((1, L), dtype=np.int8)
-    msa_mask = np.ones((1, L), dtype=bool)
-    deletion_matrix = np.zeros((1, L), dtype=np.int8)
+    # MSA: provide at least msa_n rows to avoid out-of-bounds during truncation.
+    msa = np.zeros((msa_n, L), dtype=np.int8)
+    msa_mask = np.ones((msa_n, L), dtype=bool)
+    deletion_matrix = np.zeros((msa_n, L), dtype=np.int8)
     # Profile has 31 channels
     profile = np.zeros((L, 31), dtype=np.float32)
     deletion_mean = np.zeros((L,), dtype=np.float32)
-    num_alignments = np.array(1, dtype=np.int32)
+    num_alignments = np.array(msa_n, dtype=np.int32)
 
     # Reference structure: zeros with masks
     ref_pos = np.zeros((L, D, 3), dtype=np.float32)
@@ -140,10 +318,23 @@ def _build_dm_synthetic_batch(seq_len: int) -> "Dict[str, Any]":
     res_id = np.repeat(np.arange(1, L + 1, dtype=int)[:, None], D, axis=1)
     chain_id = np.empty((L, D), dtype=object)
     chain_id[:, :] = 'A'
+    # Provide optional fields to satisfy AtomLayout.to_array() preconditions
+    atom_element = np.empty((L, D), dtype=object)
+    atom_element[:, :] = ''
+    atom_element[:, 0] = 'C'
+    res_name_opt = np.empty((L, D), dtype=object)
+    res_name_opt[:, :] = ''
+    res_name_opt[:, 0] = 'GLY'
+    chain_type = np.empty((L, D), dtype=object)
+    chain_type[:, :] = ''
+    chain_type[:, 0] = 'polypeptide(L)'
     all_token_atoms_layout = al.AtomLayout(
         atom_name=atom_name,
         res_id=res_id,
         chain_id=chain_id,
+        atom_element=atom_element,
+        res_name=res_name_opt,
+        chain_type=chain_type,
     )
 
     # Compute AtomCrossAtt gather infos via library to ensure consistency
@@ -238,6 +429,8 @@ def forward_once(
         import jax
         import jax.numpy as jnp
         import haiku as hk
+        # Provide import stubs for optional C++/RDKit extensions BEFORE DM imports
+        _ensure_dm_cpp_and_rdkit_stubs()
         from alphafold3.model import model as dm_model
         from alphafold3.model import features as dm_features
 
@@ -299,6 +492,15 @@ def forward_once(
         config = dm_model.Model.Config()
         # Reduce work for benchmarking
         config.num_recycles = 1 if mode.lower() == 'trunk' else 0
+        # Align evoformer expected MSA count with constructed batch MSA size.
+        # We constructed msa_size=16 above.
+        try:
+            config.evoformer.num_msa = max(1, int(config.evoformer.num_msa))
+            if config.evoformer.num_msa > 16:
+                config.evoformer.num_msa = 16
+        except Exception:
+            # If structure differs, do not fail; default DM config handles it.
+            pass
         # Keep embeddings off by default
         config.return_embeddings = False
         config.return_distogram = False
