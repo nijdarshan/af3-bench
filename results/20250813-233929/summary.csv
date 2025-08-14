@@ -1,0 +1,3 @@
+engine,pass_index,start_ts,elapsed_ms,device,seq_len,commit,notes,cpu_brand
+deepmind,0,2025-08-13T23:42:23.947237+00:00,53.96699905395508,cuda,64,unknown,,INTEL(R) XEON(R) PLATINUM 8558
+ligo,0,2025-08-13T23:42:28.703628+00:00,37.71042823791504,cuda,64,unknown,,INTEL(R) XEON(R) PLATINUM 8558

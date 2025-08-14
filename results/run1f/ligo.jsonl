@@ -1,0 +1,1 @@
+{"commit":"unknown","cpu_brand":"INTEL(R) XEON(R) PLATINUM 8558","device":"cuda","elapsed_ms":10.078191757202148,"engine":"ligo","error":"RuntimeError: mat1 and mat2 shapes cannot be multiplied (256x137 and 13x64)","notes":null,"ok":false,"pass_index":0,"seq_len":64,"start_ts":"2025-08-13T07:05:56.416094+00:00"}

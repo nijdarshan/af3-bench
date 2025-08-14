@@ -1,0 +1,1 @@
+{"commit":"unknown","cpu_brand":"INTEL(R) XEON(R) PLATINUM 8558","device":"cuda","elapsed_ms":10.102987289428713,"engine":"ligo","error":"RuntimeError: The size of tensor a (32) must match the size of tensor b (128) at non-singleton dimension 3","notes":null,"ok":false,"pass_index":0,"seq_len":64,"start_ts":"2025-08-13T07:02:11.673189+00:00"}

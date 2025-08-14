@@ -1,0 +1,4 @@
+engine,pass_index,start_ts,elapsed_ms,device,seq_len,commit,notes,cpu_brand
+ligo,0,2025-08-13T07:01:32.442626+00:00,10.078668594360352,cuda,64,unknown,,INTEL(R) XEON(R) PLATINUM 8558
+ligo,1,2025-08-13T07:01:32.452798+00:00,10.069608688354492,cuda,64,unknown,,INTEL(R) XEON(R) PLATINUM 8558
+ligo,2,2025-08-13T07:01:32.462888+00:00,10.068416595458984,cuda,64,unknown,,INTEL(R) XEON(R) PLATINUM 8558

@@ -104,7 +104,7 @@ node_modules/
 .env.test
 
 # Results and temporary files
-results/
+# results/
 tmp/
 temp/
 .tmp/

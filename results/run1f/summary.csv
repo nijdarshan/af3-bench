@@ -1,0 +1,2 @@
+engine,pass_index,start_ts,elapsed_ms,device,seq_len,commit,notes,cpu_brand
+ligo,0,2025-08-13T07:05:56.416094+00:00,10.078191757202148,cuda,64,unknown,,INTEL(R) XEON(R) PLATINUM 8558
