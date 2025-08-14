@@ -1,194 +1,273 @@
-## AF3 Bench — Project README
+## AF3 Bench
 
 ### Overview
-AF3 Bench is a Rust CLI that benchmarks inference-time performance for two AlphaFold3 engines by calling tiny Python shims:
-- Google DeepMind AlphaFold 3 (JAX/Haiku/XLA)
-- Ligo-Biosciences AlphaFold3 (PyTorch)
+AF3 Bench is a Rust CLI that benchmarks inference-time performance of two AlphaFold3 engines via light Python shims:
+- DeepMind AlphaFold3 (JAX/Haiku/XLA)
+- Ligo AlphaFold3 (PyTorch)
 
-You can benchmark:
-- Orchestration overhead (toy mode)
-- Model trunk compute (trunk mode)
-- Full end-to-end (full mode; best on Linux/CUDA)
+We run real model graphs with random-initialized parameters and synthetic inputs (no databases) to measure compilation and steady-state execution on a single GPU.
 
-Outputs are JSONL/CSV with per-pass timings and metadata.
+Outputs are per-pass JSONL and a CSV summary with min/median/p95.
 
-## Directory layout
+---
 
-### cli/
-Rust binary crate for the user-facing CLI.
-- Parses flags:
-  - `--engine {deepmind|ligo|both}`
+## Prerequisites
+
+- External repositories (install/clone as needed):
+  - AlphaFold3 (Ligo Biosciences): [github.com/Ligo-Biosciences/AlphaFold3](https://github.com/Ligo-Biosciences/AlphaFold3)
+  - AlphaFold3 (DeepMind): [github.com/google-deepmind/alphafold3](https://github.com/google-deepmind/alphafold3)
+
+- Optional suggested layout (clone under project `third_party/`):
+
+```bash
+mkdir -p third_party
+# Ligo Biosciences AlphaFold3
+git clone https://github.com/Ligo-Biosciences/AlphaFold3 third_party/alphafold3_ligo
+# DeepMind AlphaFold3
+git clone https://github.com/google-deepmind/alphafold3 third_party/alphafold3_deepmind
+```
+
+Note: These are external dependencies under their respective licenses. The shims add `third_party/...` to `PYTHONPATH` via `scripts/dev.sh` so AF3 engines are importable at runtime.
+
+## Architecture
+
+- `cli/` (Rust): end-user CLI, result writing, and console summaries.
+- `core/` (Rust): Python interop (PyO3) — loads and calls `py/deepmind_shim.py` or `py/ligo_shim.py`.
+- `py/` (Python): engine shims and lightweight fallbacks.
+  - `deepmind_shim.py`: Builds a synthetic DeepMind AF3 batch (features.BatchDict) and runs the actual `alphafold3.model.model.Model` forward via Haiku and JAX/XLA. Includes import-time stubs for optional C++ and RDKit modules.
+  - `ligo_shim.py`: Builds a minimal Ligo AF3 config + synthetic batch and runs the actual PyTorch model. Includes a Triton-free MSA fallback (`py/src/models/components/msa_kernel.py`).
+  - `py/src/models/components/msa_kernel.py`: A small replacement for a fused Triton op to keep the trunk path portable.
+
+`scripts/dev.sh` sets a venv, `PYO3_PYTHON`, and `PYTHONPATH` so both shims can import third_party engines when invoked from Rust.
+
+---
+
+## Deep dive: `py/deepmind_shim.py`
+
+Key responsibilities:
+- Make JAX/Haiku and DeepMind AF3 importable under PyO3
+  - Inserts venv site-packages to `sys.path`
+  - Adds `third_party/alphafold3{,-deepmind,-AlphaFold3}/(src)` to `sys.path`
+  - Stubs optional modules if missing: `alphafold3.cpp.*`, `rdkit`, and `zstandard`
+
+- Build a synthetic AF3 `features.BatchDict` with consistent shapes
+  - Padding shapes: `features.PaddingShapes(num_tokens=L, msa_size=16, num_chains=1, num_templates=0, num_atoms=ceil(L*D/32)*32)`
+    - We use `D=32` dense atoms per token; `num_atoms` is padded to multiple of 32 to match atom-attention subsets.
+  - Token features: `residue_index`, `token_index`, `aatype`, `seq_mask`, `seq_length`, `asym_id`, `entity_id`, `sym_id`, `is_*` booleans
+  - MSA features: arrays of shape `[16, L]` (`msa`, `msa_mask`, `deletion_matrix`), plus per-token `profile (L,31)` and `deletion_mean (L,)`, with `num_alignments=16`
+  - Templates: present but empty (`template_aatype/positions/mask` with 0 templates, padded by model as needed)
+  - Reference structure: zeros for `ref_pos (L, D, 3)`, masks and metadata
+  - Predicted structure info: `pred_dense_atom_mask (L,D)`, `residue_center_index (L,)`
+  - Bonds: empty `GatherInfo` dicts for polymer-ligand and ligand-ligand bonds
+  - Frames: `frames_mask (L,) = True`
+  - Atom layouts and cross-attention:
+    - Construct a per-token atom layout with only atom 0 valid (`'CA'`) and fill optional layout fields (element, residue name, chain type)
+    - Compute `features.AtomCrossAtt.compute_features` to generate gather indices for token/atom queries and keys with `queries_subset_size=32`, `keys_subset_size=128`
+
+- Configure and run the real Haiku model
+  - Build `dm_model.Model.Config()` and set:
+    - `config.num_recycles = 1` for trunk; `0` for full
+    - `config.return_embeddings = False`, `config.return_distogram = False`
+    - Diffusion steps: `2` in trunk mode, `8` in full mode for reasonable runtime
+    - Cap Evoformer MSA use: `config.evoformer.num_msa = min(config.evoformer.num_msa, 16)` to match our constructed MSA
+  - Transform and JIT:
+    - `@hk.transform` → `init` with RNG and synthetic batch, `apply` JIT on target device
+  - Measure `compile_ms` on a warmup call; then run N passes capturing `elapsed_ms`
+  - Device selection: `--device cuda` will pick the first JAX GPU; use `CUDA_VISIBLE_DEVICES=<single_gpu>` to pin to one GPU
+  - MPS maps to CPU (JAX limitation)
+
+Returned JSON fields per pass:
+- `engine, pass_index, start_ts, elapsed_ms, device, seq_len, notes, compile_ms, gpu_name, mode, ok` (and `error` if failure)
+
+What is simplified vs. the full DeepMind pipeline:
+- Random-init params (no official weights)
+- Synthetic features (no external MSA/template databases)
+- Reduced `num_recycles` and diffusion steps
+- Import-time stubs for C++ and RDKit to avoid heavy system deps
+
+Despite the simplifications, the JAX/Haiku graph is the real model; compute/memory/compilation reflect genuine execution.
+
+---
+
+## Deep dive: `py/ligo_shim.py`
+
+Key responsibilities:
+- Make Ligo AF3 importable and stable under PyO3
+  - Insert venv site-packages and relevant third_party roots
+  - Monkey patch `src.models.components.msa_kernel` with our pure-PyTorch fallback (`py/src/models/components/msa_kernel.py`) to avoid Triton dependency
+
+- Build a minimal configuration
+  - Small channel sizes for tokens/pairs/atoms
+  - Short stacks for MSA and Pairformer blocks
+  - Diffusion module configured but steps are light; in non-`full` mode the sampling is replaced by a no-op tensor on some backends
+
+- Build a synthetic batch
+  - `seq_len = L`, atoms per token = 4
+  - Token indices (`residue_index`, `token_index`) and masks, `is_*` flags
+  - Atom-wise reference tensors (`ref_pos`, `ref_mask`, `ref_element` one-hot limited to H/C/N/O)
+  - Mapping features: `atom_to_token`, `token_atom_idx`, `token_repr_atom`, `ref_space_uid`
+  - MSA features: `msa_feat (B, n_msa, L, 49)`, `msa_mask (B, n_msa, L)`
+
+- Run the real PyTorch model
+  - `AlphaFold3(cfg).eval()` on selected device (`cuda|mps|cpu`)
+  - Warmup call measured as `compile_ms`; then N passes capturing `elapsed_ms`
+
+Returned JSON fields mirror the DeepMind shim where applicable, including `compile_ms` and `gpu_name`.
+
+Fallback kernel: `py/src/models/components/msa_kernel.py`
+- Implements `MSAWeightedAveragingFused` as a pure-PyTorch op; matches expected interface so the trunk path runs without Triton.
+
+---
+
+## Rust crates
+
+### `core/` — PyO3 interop
+- Function: `af3_core::call_shim(engine, passes, device, seq_len, notes, full, mode)`
+  - Imports the shim module (`deepmind_shim` or `ligo_shim`)
+  - Calls `forward_once(...)` with kwargs
+  - Converts Python result to JSON via Python’s `json.dumps` and returns a `serde_json::Value`
+
+### `cli/` — Command-line interface
+- Flags:
+  - `--engine {deepmind|ligo|both}` (default: both)
   - `--mode {toy|trunk|full}` (default: trunk)
   - `--device {cpu|mps|cuda}` (default: cpu)
-  - `--passes <N>`, `--seq-len <int>`, `--full` (legacy flag), `--notes`, `--out`
-- Calls into `core` to execute the selected mode for each engine.
-- Writes artifacts:
-  - `results/<timestamp>/<engine>.jsonl`
-  - `results/<timestamp>/summary.csv`
-- Prints console summaries (min/median/p95) and artifact paths.
+  - `--passes N` (default: 1 unless `--dry-run`)
+  - `--seq-len L` (default: 32)
+  - `--full` (alias for full path; kept for compatibility)
+  - `--notes`, `--out results/<dir>`
+- Writes `results/<timestamp>/{deepmind,ligo}.jsonl` and a `summary.csv` with host and commit metadata. Prints per-engine min/median/p95.
 
-Key file:
-- `cli/src/main.rs`
+---
 
-### core/
-Rust library crate handling Python interop via PyO3.
-- Exposes `call_shim(engine, passes, device, seq_len, notes, full, mode)` which:
-  - Imports `deepmind_shim` or `ligo_shim`
-  - Calls `forward_once(...)`
-  - Returns results as JSON
-- Keeps Rust clean by pushing engine-specific details into Python.
+## Setup (Linux/CUDA single-GPU)
 
-Key file:
-- `core/src/lib.rs`
-
-### py/
-Python shims and helpers.
-- `ligo_shim.py`
-  - Modes:
-    - `toy`: tiny Torch op (matmul + tanh), for orchestration overhead.
-    - `trunk`: real Ligo trunk (embedder/MSA/Pairformer) with minimal config and dummy features.
-    - `full`: for Linux/CUDA later (on macOS MPS, diffusion is stubbed due to fp64 limits).
-  - Device selection:
-    - `mps` if available, else `cpu`
-    - Triton kernel shadowed with a PyTorch fallback.
-  - Suppresses Python warnings for clean CLI output.
-
-- `deepmind_shim.py`
-  - Modes:
-    - `toy`: tiny JAX op (matmul + tanh), runs on CPU (macOS maps `mps` → `cpu`).
-    - `trunk`/`full`: planned for Linux/CUDA; on macOS we currently use toy for parity/testing.
-  - Ensures venv site-packages are visible when called from Rust.
-
-- `af3_fallback/`
-  - `msa_kernel.py`: fallback implementation to replace Triton-only kernels for Ligo on macOS.
-
-Notes:
-- “Dummy features” = synthetic tensors matching expected shapes/dtypes; sufficient to exercise the model trunk without a full preprocessing pipeline.
-- Random-init params used (no actual weights) per the initial scope.
-
-### third_party/
-Pinned engine repositories; not modified here.
-- `third_party/alphafold3-ligo/`: Ligo PyTorch AF3
-- `third_party/alphafold3-deepmind/`: DeepMind AF3 (JAX/Haiku/XLA)
-
-We import these via `PYTHONPATH` (set by `scripts/dev.sh`).
-
-## Setup
-
-- Use the provided venv and environment script:
-  ```bash
-  cd /Users/darsh/ai/af3-bench
-  source scripts/dev.sh
-  ```
-- Build:
-  ```bash
-  cargo build
-  ```
-- Recommended Python deps (already used during development):
-  - Ligo: torch, lightning, hydra-core, rich, ml-collections
-  - DeepMind toy: jax[cpu]
-  - We do not alter third_party repos; shims add fallbacks where needed.
-
-## Running
-
-### Common flags
-- `--engine {deepmind|ligo|both}`
-- `--mode {toy|trunk|full}`:
-  - toy: tiny op (overhead only; both engines supported)
-  - trunk: model’s main blocks
-    - Ligo on macOS MPS works (with fallbacks)
-    - DeepMind trunk: use Linux/CUDA later (macOS impractical)
-  - full: end-to-end including diffusion (best on Linux/CUDA for both)
-- `--device {cpu|mps|cuda}`
-- `--passes N`, `--seq-len L`
-- `--notes "text"`, `--out results/<dir>`
-
-### Examples
-- Orchestration-only compare (CPU):
-  ```bash
-  target/debug/af3-bench run --engine both --mode toy --device cpu --passes 10 --seq-len 64
-  ```
-- Ligo trunk on macOS MPS:
-  ```bash
-  target/debug/af3-bench run --engine ligo --mode trunk --device mps --passes 5 --seq-len 32
-  ```
-- Both engines toy on MPS:
-  ```bash
-  target/debug/af3-bench run --engine both --mode toy --device mps --passes 3 --seq-len 16
-  ```
-- Full end-to-end (Linux/CUDA; planned flow):
-  ```bash
-  target/debug/af3-bench run --engine both --mode full --device cuda --passes 5 --seq-len 64
-  ```
-
-## Outputs
-
-- JSONL per engine: one JSON object per pass
-  - Fields: engine, pass_index, start_ts, elapsed_ms, device, seq_len, notes, commit, cpu_brand, ok, (optional error)
-- CSV summary consolidating both engines:
-  - `engine,pass_index,start_ts,elapsed_ms,device,seq_len,commit,notes,cpu_brand`
-
-Example:
-```
-results/<timestamp>/deepmind.jsonl
-results/<timestamp>/ligo.jsonl
-results/<timestamp>/summary.csv
+1) Create and activate venv, then source environment:
+```bash
+cd /home/adminsteve/ceph/mlx-server/k8s/metaphor-genie/af3-bench
+python3 -m venv .venv
+source .venv/bin/activate
+source scripts/dev.sh
 ```
 
-## Platform notes
+2) Install Python deps (examples):
+```bash
+python -m pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install jax[cuda12_local] -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install haiku jaxtyping typeguard==2.13.3 numpy
+```
 
-- macOS (Apple Silicon M4, MPS):
-  - Ligo trunk is supported with fallbacks; diffusion is stubbed in MPS path (no fp64).
-  - DeepMind (JAX) on MPS is not supported; toy JAX runs on CPU. Trunk/full to be run on Linux/CUDA.
+3) Build CLI:
+```bash
+cargo build
+```
 
-- Linux/CUDA (NVIDIA):
-  - Best environment for fair, end-to-end comparison of both engines.
-  - Triton kernels and JAX/XLA GPU available.
+4) Pin to a single GPU (example: GPU 1) and recommended XLA memory env:
+```bash
+export CUDA_VISIBLE_DEVICES=1
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=.85
+```
 
-## Current status
+---
 
-- CLI/core implemented; JSONL/CSV writing and console summaries done.
-- Ligo:
-  - toy/trunk modes working on macOS MPS (with Triton fallback).
-  - full planned for Linux/CUDA.
-- DeepMind:
-  - toy mode (JAX CPU) working.
-  - trunk/full planned for Linux/CUDA; macOS impractical.
+## Usage (single GPU)
 
-## Suggested usage patterns
+Trunk, 5 passes (both engines):
+```bash
+export CUDA_VISIBLE_DEVICES=1; source scripts/dev.sh; \
+cargo run -q --manifest-path cli/Cargo.toml -- run --engine both --device cuda --seq-len 64 --passes 5 --mode trunk
+```
 
-- Validate plumbing/overhead parity:
-  - `--mode toy` on same device for both.
-- Get meaningful model timing on macOS now:
-  - `--engine ligo --mode trunk --device mps`
-- Deliver production-like results:
-  - Move to Linux/CUDA and run `--mode full --device cuda` for both engines with the same `passes` and `seq_len`.
+Full, 5 passes (both engines):
+```bash
+export CUDA_VISIBLE_DEVICES=1; source scripts/dev.sh; \
+cargo run -q --manifest-path cli/Cargo.toml -- run --engine both --device cuda --seq-len 64 --passes 5 --mode full --full
+```
 
-## Development tips
+Single-engine examples (1 pass):
+```bash
+export CUDA_VISIBLE_DEVICES=1; source scripts/dev.sh; \
+cargo run -q --manifest-path cli/Cargo.toml -- run --engine deepmind --device cuda --seq-len 64 --passes 1 --mode trunk
 
-- Always:
-  ```bash
-  source scripts/dev.sh
-  ```
-  to set `PYO3_PYTHON` and `PYTHONPATH`.
+export CUDA_VISIBLE_DEVICES=1; source scripts/dev.sh; \
+cargo run -q --manifest-path cli/Cargo.toml -- run --engine deepmind --device cuda --seq-len 64 --passes 1 --mode full --full
+```
 
-- If you see import issues under PyO3:
-  - Ensure `jax[cpu]` (for DeepMind toy) or `torch` (for Ligo) is installed in `.venv`.
-  - The shims prepend venv site-packages path when embedded; `scripts/dev.sh` also aligns environment.
+Outputs:
+- `results/<timestamp>/deepmind.jsonl`
+- `results/<timestamp>/ligo.jsonl`
+- `results/<timestamp>/summary.csv`
 
-- Extend modes easily by adding branches in `forward_once(...)` in `py/*_shim.py`.
+Each JSONL line contains timings and metadata per pass. CSV aggregates basic stats.
 
-- Keep third_party repos unmodified; any quirks go in `py/` shims.
+---
 
-## Next steps
+## How to modify behavior
 
-- Linux/CUDA (recommended)
-  - DeepMind: implement minimal trunk/full forwards with dummy features and random-init params; report compile_ms vs exec_ms (JAX/XLA); add `--warmup`.
-  - Ligo: run full end-to-end without fallbacks; optionally expose standard model configs.
-- CLI and reporting
-  - Add flags for warmup and compile/exec split; unify CSV columns across engines; capture GPU name and device details.
-  - Optionally emit a Markdown summary alongside JSONL/CSV.
-- Features
-  - Provide a standardized synthetic feature generator and a loader for provided example features; allow parametric `seq_len`.
-- macOS
-  - Keep toy/trunk modes; document MPS limitations (no fp64, no Triton); ensure dtype guards and suppressed warnings for clean output.
+DeepMind (`py/deepmind_shim.py`):
+- MSA rows: change `msa_n` (default 16) and `features.PaddingShapes.msa_size`. Also cap `config.evoformer.num_msa` accordingly.
+- Atom subsets: tune `queries_subset_size` (default 32) and `keys_subset_size` (default 128).
+- Diffusion steps: set `config.heads.diffusion.eval.steps` (2 in trunk, 8 in full by default here).
+- Recycles: set `config.num_recycles` (1 in trunk, 0 in full by default here).
+- Device: control with `--device` and `CUDA_VISIBLE_DEVICES`.
+
+Ligo (`py/ligo_shim.py`):
+- Model depth/channels: edit `_build_minimal_ligo_config()` (`pairformer_stack.no_blocks`, channel sizes, diffusion heads/blocks).
+- Diffusion sampling: trunk mode may stub sampling depending on backend; force real sampling by running `--mode full`.
+- Synthetic batch: change atoms per token (default 4) and feature sizes in `_build_dummy_batch()`.
+- Fused MSA kernel: see `py/src/models/components/msa_kernel.py` if you want to swap back to Triton.
+
+Rust CLI (`cli/src/main.rs`):
+- Extend flags, add warmup-only passes, or new report columns. The CLI writes JSONL per engine and a combined CSV.
+
+---
+
+## Troubleshooting
+
+- JAX OOM with DeepMind full:
+  - Pick a free GPU via `export CUDA_VISIBLE_DEVICES=<id>`
+  - Reduce `config.heads.diffusion.eval.steps` or increase `XLA_PYTHON_CLIENT_MEM_FRACTION` cautiously
+  - Ensure `XLA_PYTHON_CLIENT_PREALLOCATE=false`
+
+- Import errors under PyO3:
+  - Always `source scripts/dev.sh`
+  - Verify `.venv` packages: `torch`, `jax`, `dm-haiku`, `numpy`, `typeguard==2.13.3`
+
+---
+
+## Sample results (CUDA, single H200)
+
+DeepMind trunk (5 passes, L=64):
+```
+min≈50.53ms median≈51.999ms p95≈53.632ms
+```
+
+DeepMind full (5 passes, L=64):
+```
+min≈66.964ms median≈69.988ms p95≈72.064ms
+```
+
+Ligo trunk (5 passes, L=64):
+```
+min≈19.01ms median≈19.05ms p95≈19.95ms
+```
+
+Ligo full (5 passes, L=64):
+```
+median≈1.61s (diffusion sampling)
+```
+
+Exact JSONL artifacts are saved in `results/<timestamp>/` and include `compile_ms` for the first compiled call.
+
+---
+
+## Notes on “real inference”
+
+These runs execute the genuine model graphs end-to-end (JAX/Haiku or PyTorch), but with:
+- Random-initialized parameters (no released AF3 weights)
+- Synthetic features instead of database-driven MSA/templates
+- Reduced recycles and diffusion steps for repeatable performance benchmarking
+
+Therefore outputs are not meaningful structures, but compilation/memory/runtime are representative of the true compute.
