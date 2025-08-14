@@ -237,7 +237,7 @@ Rust CLI (`cli/src/main.rs`):
 
 ---
 
-## Sample results (CUDA, single H200)
+## Sample results (CUDA, single GPU)
 
 DeepMind trunk (5 passes, L=64):
 ```
